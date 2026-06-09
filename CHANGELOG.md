@@ -8,6 +8,32 @@ Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
 
 ---
 
+## [0.6.0] — 2026-06-09
+
+### Added
+- **Find all references** — from a class or ID in an HTML `class=""` / `id=""`
+  attribute, finds every other HTML file in the workspace that uses the same
+  name (`textDocument/references`)
+- **Rename** — renaming a class or ID updates its CSS selector definition and
+  every HTML attribute reference across the workspace (`textDocument/rename`)
+- **Code action: Create class/ID** — when a class or ID is flagged as undefined
+  in HTML, a Quick Fix offer appears to append the rule to the nearest CSS file
+  (`textDocument/codeAction`)
+- **CSS variable completions** — CSS custom properties (`--name`) are extracted
+  from parsed CSS and offered as completions when typing `--` inside a
+  `style="..."` attribute
+- **CSS variable hover** — hovering over a `--variable-name` inside `style=""`
+  shows its declared value
+- **Color values in hover** — hex, `rgb()`, and `hsl()` values found in a
+  rule's properties are highlighted inline in the tooltip
+- **Unused-selector hint** — CSS selectors not referenced in any currently-open
+  HTML file are flagged with a soft hint; suppressed when no HTML files are open
+  so JS-driven classes are never falsely flagged
+- **File size cap** — CSS files over 500 KB are skipped during scanning to
+  prevent stalling on minified bundles
+
+---
+
 ## [0.5.0] — 2026-06-09
 
 ### Added

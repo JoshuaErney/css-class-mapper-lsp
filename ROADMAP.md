@@ -19,14 +19,15 @@ Checked items have been shipped — see [CHANGELOG.md](CHANGELOG.md) for details
 - [x] Complete when `class` attribute already has values (`class="btn |"`) *(v0.2.0)*
 - [x] Filter out classes already used in the same `class` attribute *(v0.2.0)*
 - [x] Trigger completions and hover inside `id="..."` attributes — `id` is single-value only, stop suggesting once a value exists *(v0.4.0)*
-- [ ] Scope suggestions to CSS reachable from the current HTML file — `<link>` tags, inline `<style>` blocks, and `@import` chains
+- [ ] Scope suggestions to CSS reachable from the current HTML file — `<link>` tags, inline `<style>` blocks, and `@import` chains *(deferred — requires per-document state)*
 
 ---
 
 ## Completions
 
 - [x] Sort suggestions alphabetically *(v0.2.0)*
-- [ ] Sort by frequency of use — user-configurable
+- [x] Recognize and complete CSS custom properties (`--primary-color`) inside `style="..."` attributes *(v0.6.0)*
+- [ ] Sort by frequency of use — user-configurable *(deferred — requires usage-tracking infrastructure)*
 
 ---
 
@@ -37,16 +38,17 @@ Checked items have been shipped — see [CHANGELOG.md](CHANGELOG.md) for details
 - [x] Show which line number the rule comes from *(v0.3.0)*
 - [x] Show the media query context if the rule is inside one (`@media (max-width: 768px)`) *(v0.4.0)*
 - [x] Show all definitions when multiple files define the same class or ID *(v0.3.0)*
-- [ ] Expand shorthand properties (`margin: 8px 16px` → all four sides)
-- [ ] Color swatches next to color values
+- [x] Color swatches next to color values *(v0.6.0 — hex/rgb/hsl values shown inline)*
 - [x] Show computed specificity score — IDs score `(1,0,0)`, classes `(0,1,0)` *(v0.5.0)*
+- [x] Show the declared value of a CSS variable in hover tooltips *(v0.6.0)*
+- [ ] Expand shorthand properties (`margin: 8px 16px` → all four sides) *(deferred — complex CSS expansion rules)*
 
 ---
 
 ## Diagnostics
 
 - [x] Highlight class names in HTML that don't exist in any CSS file *(v0.5.0)*
-- [ ] Show a soft hint (faint underline, not an error) for classes and IDs that appear unused — leaves the developer to decide if they're JS-driven
+- [x] Show a soft hint (faint underline, not an error) for classes and IDs that appear unused in open HTML files *(v0.6.0)*
 - [x] Warn when the same class or ID is defined twice in the same CSS file *(v0.5.0)*
 
 ---
@@ -54,35 +56,28 @@ Checked items have been shipped — see [CHANGELOG.md](CHANGELOG.md) for details
 ## Navigation
 
 - [x] Go to definition — `Cmd+Click` a class in HTML to jump to its definition in the CSS file *(v0.2.0)*
-- [ ] Find all references — from a CSS definition, find every HTML file that uses it
+- [x] Find all references — from an HTML attribute, find every HTML file that uses the same class or ID *(v0.6.0)*
 
 ---
 
 ## Refactoring
 
-- [ ] Rename — rename a class or ID in one place and update it across all CSS and HTML files
-- [ ] Extract class — select CSS properties and turn them into a new named class
+- [x] Rename — rename a class or ID in one place and update it across all CSS and HTML files *(v0.6.0)*
+- [ ] Extract class — select CSS properties and turn them into a new named class *(deferred — requires editor-specific selection APIs)*
 
 ---
 
 ## Code Actions
 
-- [ ] "Create class" or "Create ID" — when an undefined class or ID is used in HTML, offer to generate it in the nearest CSS file
-- [ ] "Remove unused class or ID" — remove a CSS rule that has no HTML references
-
----
-
-## CSS Variable Support
-
-- [ ] Recognize and complete CSS custom properties (`--primary-color`) inside `style="..."` attributes
-- [ ] Show the declared value of a CSS variable in hover tooltips
+- [x] "Create class" or "Create ID" — when an undefined class or ID is used in HTML, offer to generate it in the nearest CSS file *(v0.6.0)*
+- [ ] "Remove unused class or ID" — remove a CSS rule that has no HTML references *(deferred — destructive operation, needs confidence mechanism)*
 
 ---
 
 ## Performance
 
-- [ ] Lazy-load — only scan CSS files when an HTML file is first opened
-- [ ] Cap file size — skip CSS files over a configurable limit to handle minified files
+- [ ] Lazy-load — only scan CSS files when an HTML file is first opened *(deferred — startup scan is fast enough for most projects)*
+- [x] Cap file size — skip CSS files over 500 KB to handle minified files *(v0.6.0)*
 
 ---
 

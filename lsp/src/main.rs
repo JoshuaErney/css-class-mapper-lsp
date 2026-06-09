@@ -38,10 +38,22 @@ fn id_attr_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r#"(?i)\bid\s*=\s*(["'])"#).unwrap())
 }
 
-// Matches @import "path", @import 'path', @import url("path"), @import url('path').
+fn style_attr_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(?i)\bstyle\s*=\s*(["'])"#).unwrap())
+}
+
 fn import_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r#"@import\s+(?:url\()?["']([^"']+)["']"#).unwrap())
+}
+
+// Matches common CSS color values for display in hover tooltips.
+fn color_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)#[0-9a-f]{3,8}\b|rgba?\s*\([^)]+\)|hsla?\s*\([^)]+\)").unwrap()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -50,20 +62,16 @@ fn import_re() -> &'static Regex {
 
 #[derive(Debug, Clone)]
 struct ClassInfo {
-    /// Raw property declarations inside the `{ }` block (trimmed).
     properties: String,
-    /// Full selector string (pseudos stripped), e.g. `.btn.btn--primary` or `#hero`.
     selector: String,
-    /// @media or @supports condition if the rule is nested inside one.
     media_query: Option<String>,
-    /// Basename of the CSS file — used for display only (e.g. "styles.css").
     source_file: String,
-    /// Full canonical path — used to remove stale entries when a file changes.
     source_path: String,
-    /// 0-based line number of the rule in the source file.
     definition_line: u32,
 }
 
+/// CSS custom properties map: `"--name"` → `"value"`.
+type VarMap = HashMap<String, String>;
 type ClassMap = HashMap<String, Vec<ClassInfo>>;
 type DocumentMap = HashMap<Url, String>;
 
@@ -87,6 +95,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Left(true)),
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         ..Default::default()
     };
 
@@ -107,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(ref root) = root_path {
         scan_directory(root, &mut class_map);
     }
+    let mut var_map: VarMap = refresh_var_map(&class_map);
 
     let init_result = InitializeResult {
         capabilities,
@@ -135,7 +147,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     &req.method,
                     &req.params,
                     &class_map,
+                    &var_map,
                     &documents,
+                    root_path.as_deref(),
                 );
                 connection.sender.send(Message::Response(resp))?;
             }
@@ -144,6 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     &notif.method,
                     notif.params,
                     &mut class_map,
+                    &mut var_map,
                     &mut documents,
                 );
                 for n in outgoing {
@@ -167,24 +182,44 @@ fn route_request(
     method: &str,
     params: &Value,
     class_map: &ClassMap,
+    var_map: &VarMap,
     documents: &DocumentMap,
+    root_path: Option<&Path>,
 ) -> Response {
     match method {
         "textDocument/completion" => {
             match serde_json::from_value::<CompletionParams>(params.clone()) {
-                Ok(p) => completion_handler(id, p, class_map, documents),
+                Ok(p) => completion_handler(id, p, class_map, var_map, documents),
                 Err(e) => Response::new_err(id, -32602, e.to_string()),
             }
         }
         "textDocument/hover" => {
             match serde_json::from_value::<HoverParams>(params.clone()) {
-                Ok(p) => hover_handler(id, p, class_map, documents),
+                Ok(p) => hover_handler(id, p, class_map, var_map, documents),
                 Err(e) => Response::new_err(id, -32602, e.to_string()),
             }
         }
         "textDocument/definition" => {
             match serde_json::from_value::<GotoDefinitionParams>(params.clone()) {
                 Ok(p) => definition_handler(id, p, class_map, documents),
+                Err(e) => Response::new_err(id, -32602, e.to_string()),
+            }
+        }
+        "textDocument/references" => {
+            match serde_json::from_value::<ReferenceParams>(params.clone()) {
+                Ok(p) => references_handler(id, p, class_map, documents, root_path),
+                Err(e) => Response::new_err(id, -32602, e.to_string()),
+            }
+        }
+        "textDocument/rename" => {
+            match serde_json::from_value::<RenameParams>(params.clone()) {
+                Ok(p) => rename_handler(id, p, class_map, documents, root_path),
+                Err(e) => Response::new_err(id, -32602, e.to_string()),
+            }
+        }
+        "textDocument/codeAction" => {
+            match serde_json::from_value::<CodeActionParams>(params.clone()) {
+                Ok(p) => code_action_handler(id, p, class_map, documents),
                 Err(e) => Response::new_err(id, -32602, e.to_string()),
             }
         }
@@ -200,6 +235,7 @@ fn route_notification(
     method: &str,
     params: Value,
     class_map: &mut ClassMap,
+    var_map: &mut VarMap,
     documents: &mut DocumentMap,
 ) -> Vec<lsp_server::Notification> {
     let mut out: Vec<lsp_server::Notification> = Vec::new();
@@ -236,7 +272,6 @@ fn route_notification(
         }
         "workspace/didChangeWatchedFiles" => {
             if let Ok(p) = serde_json::from_value::<DidChangeWatchedFilesParams>(params) {
-                // Collect affected CSS paths before mutating the map.
                 let affected: Vec<(PathBuf, FileChangeType)> = p
                     .changes
                     .iter()
@@ -251,8 +286,8 @@ fn route_notification(
                     .collect();
 
                 update_css_map(&p, class_map);
+                *var_map = refresh_var_map(class_map);
 
-                // Emit diagnostics for each changed CSS file.
                 for (path, typ) in &affected {
                     if let Ok(uri) = Url::from_file_path(path) {
                         let diags = if *typ == FileChangeType::DELETED {
@@ -264,8 +299,12 @@ fn route_notification(
                     }
                 }
 
-                // Refresh HTML diagnostics for all open HTML documents since the
-                // class map may have changed.
+                // Unused-selector hints for CSS files (based on open HTML docs).
+                for (css_uri, diags) in diagnostics_for_unused(class_map, documents) {
+                    out.push(publish_diagnostics(css_uri, diags));
+                }
+
+                // Refresh HTML diagnostics since the class map changed.
                 let html_diags: Vec<_> = documents
                     .iter()
                     .filter(|(uri, _)| is_html_uri(uri))
@@ -290,6 +329,7 @@ fn completion_handler(
     id: RequestId,
     params: CompletionParams,
     class_map: &ClassMap,
+    var_map: &VarMap,
     documents: &DocumentMap,
 ) -> Response {
     let uri = &params.text_document_position.text_document.uri;
@@ -300,6 +340,7 @@ fn completion_handler(
         None => return Response::new_ok(id, json!(null)),
     };
 
+    // class="..." — offer class names
     if in_class_attribute(text, pos) {
         let (existing_classes, prefix) = completion_context(text, pos);
         let prefix_lower = prefix.to_lowercase();
@@ -333,9 +374,9 @@ fn completion_handler(
         );
     }
 
+    // id="..." — offer ID names (single-value guard)
     if in_id_attribute(text, pos) {
         let (has_existing_value, prefix) = id_completion_context(text, pos);
-        // id="" is single-value — stop suggesting once a complete value exists.
         if has_existing_value {
             return Response::new_ok(id, json!(null));
         }
@@ -345,7 +386,7 @@ fn completion_handler(
             .iter()
             .filter(|(name, _)| name.starts_with('#'))
             .filter(|(name, _)| {
-                let bare_lower = name[1..].to_lowercase(); // strip leading `#`
+                let bare_lower = name[1..].to_lowercase();
                 prefix.is_empty() || bare_lower.starts_with(&prefix_lower)
             })
             .map(|(name, infos)| {
@@ -369,6 +410,31 @@ fn completion_handler(
         );
     }
 
+    // style="..." — offer CSS custom properties when prefix starts with `--`
+    if in_style_attribute(text, pos) {
+        let prefix = style_prefix(text, pos);
+        if prefix.starts_with("--") {
+            let prefix_lower = prefix.to_lowercase();
+            let mut items: Vec<CompletionItem> = var_map
+                .iter()
+                .filter(|(name, _)| name.to_lowercase().starts_with(&prefix_lower))
+                .map(|(name, value)| CompletionItem {
+                    label: name.clone(),
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail: Some(value.clone()),
+                    insert_text: Some(name.clone()),
+                    filter_text: Some(name.to_lowercase()),
+                    ..Default::default()
+                })
+                .collect();
+            items.sort_by(|a, b| a.label.cmp(&b.label));
+            return Response::new_ok(
+                id,
+                serde_json::to_value(CompletionResponse::Array(items)).unwrap_or(json!(null)),
+            );
+        }
+    }
+
     Response::new_ok(id, json!(null))
 }
 
@@ -376,6 +442,7 @@ fn hover_handler(
     id: RequestId,
     params: HoverParams,
     class_map: &ClassMap,
+    var_map: &VarMap,
     documents: &DocumentMap,
 ) -> Response {
     let uri = &params.text_document_position_params.text_document.uri;
@@ -385,6 +452,26 @@ fn hover_handler(
         Some(t) => t,
         None => return Response::new_ok(id, json!(null)),
     };
+
+    // style="..." — hover over a CSS variable name (--foo)
+    if in_style_attribute(text, pos) {
+        let word = match word_at(text, pos) {
+            Some(w) if w.starts_with("--") => w,
+            _ => return Response::new_ok(id, json!(null)),
+        };
+        let value = match var_map.get(&word) {
+            Some(v) => v,
+            None => return Response::new_ok(id, json!(null)),
+        };
+        let hover = Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("**{}**\n\n```css\n{}: {};\n```", word, word, value),
+            }),
+            range: None,
+        };
+        return Response::new_ok(id, serde_json::to_value(hover).unwrap_or(json!(null)));
+    }
 
     let lookup_key = if in_class_attribute(text, pos) {
         match word_at(text, pos) {
@@ -413,8 +500,14 @@ fn hover_handler(
             .map(|mq| format!("\n_inside_ `{mq}`"))
             .unwrap_or_default();
         let (a, b, c) = specificity(&info.selector);
+        let colors = color_summary(&info.properties);
+        let color_line = if colors.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nColors: {colors}")
+        };
         format!(
-            "**{}** — {}:{}{}\n\nSpecificity: `({a},{b},{c})`\n\n```css\n{} {{\n{}\n}}\n```",
+            "**{}** — {}:{}{}\n\nSpecificity: `({a},{b},{c})`{color_line}\n\n```css\n{} {{\n{}\n}}\n```",
             lookup_key,
             info.source_file,
             info.definition_line + 1,
@@ -514,8 +607,223 @@ fn definition_handler(
     Response::new_ok(id, result)
 }
 
+fn references_handler(
+    id: RequestId,
+    params: ReferenceParams,
+    _class_map: &ClassMap,
+    documents: &DocumentMap,
+    root_path: Option<&Path>,
+) -> Response {
+    let uri = &params.text_document_position.text_document.uri;
+    let pos = params.text_document_position.position;
+
+    let text = match documents.get(uri) {
+        Some(t) => t,
+        None => return Response::new_ok(id, json!([])),
+    };
+
+    let lookup_key = if in_class_attribute(text, pos) {
+        match word_at(text, pos) {
+            Some(w) => w,
+            None => return Response::new_ok(id, json!([])),
+        }
+    } else if in_id_attribute(text, pos) {
+        match word_at(text, pos) {
+            Some(w) => format!("#{w}"),
+            None => return Response::new_ok(id, json!([])),
+        }
+    } else {
+        return Response::new_ok(id, json!([]));
+    };
+
+    let root = match root_path {
+        Some(r) => r,
+        None => return Response::new_ok(id, json!([])),
+    };
+
+    let locations = workspace_html_refs(&lookup_key, root, documents);
+    Response::new_ok(id, serde_json::to_value(locations).unwrap_or(json!([])))
+}
+
+fn rename_handler(
+    id: RequestId,
+    params: RenameParams,
+    class_map: &ClassMap,
+    documents: &DocumentMap,
+    root_path: Option<&Path>,
+) -> Response {
+    let uri = &params.text_document_position.text_document.uri;
+    let pos = params.text_document_position.position;
+    let new_name = &params.new_name;
+
+    let text = match documents.get(uri) {
+        Some(t) => t,
+        None => return Response::new_ok(id, json!(null)),
+    };
+
+    let lookup_key = if in_class_attribute(text, pos) {
+        match word_at(text, pos) {
+            Some(w) => w,
+            None => return Response::new_ok(id, json!(null)),
+        }
+    } else if in_id_attribute(text, pos) {
+        match word_at(text, pos) {
+            Some(w) => format!("#{w}"),
+            None => return Response::new_ok(id, json!(null)),
+        }
+    } else {
+        return Response::new_ok(id, json!(null));
+    };
+
+    let is_id = lookup_key.starts_with('#');
+    let old_bare = if is_id { &lookup_key[1..] } else { &lookup_key };
+    let prefix_char = if is_id { '#' } else { '.' };
+    let old_pattern = format!("{prefix_char}{old_bare}");
+    let new_pattern = format!("{prefix_char}{new_name}");
+
+    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+    // CSS edits: replace selector on each definition line.
+    if let Some(infos) = class_map.get(&lookup_key) {
+        for info in infos {
+            let css_path = Path::new(&info.source_path);
+            let css_uri = match Url::from_file_path(css_path) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            let content = match fs::read_to_string(css_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let line_text = match content.lines().nth(info.definition_line as usize) {
+                Some(l) => l,
+                None => continue,
+            };
+            // Replace the first occurrence on the selector line (before any `{`).
+            let selector_part = line_text.split('{').next().unwrap_or(line_text);
+            if let Some(col) = selector_part.find(&old_pattern) {
+                changes.entry(css_uri).or_default().push(TextEdit {
+                    range: Range {
+                        start: Position {
+                            line: info.definition_line,
+                            character: col as u32,
+                        },
+                        end: Position {
+                            line: info.definition_line,
+                            character: (col + old_pattern.len()) as u32,
+                        },
+                    },
+                    new_text: new_pattern.clone(),
+                });
+            }
+        }
+    }
+
+    // HTML edits: rename every attribute token across all workspace HTML files.
+    let root = match root_path {
+        Some(r) => r,
+        None => {
+            let edit = WorkspaceEdit { changes: Some(changes), ..Default::default() };
+            return Response::new_ok(id, serde_json::to_value(edit).unwrap_or(json!(null)));
+        }
+    };
+
+    for r in workspace_html_refs(&lookup_key, root, documents) {
+        // workspace_html_refs already filters to exact matches; each location is
+        // one token in an attribute value.
+        changes.entry(r.uri.clone()).or_default().push(TextEdit {
+            range: r.range,
+            new_text: new_name.clone(),
+        });
+    }
+
+    let edit = WorkspaceEdit { changes: Some(changes), ..Default::default() };
+    Response::new_ok(id, serde_json::to_value(edit).unwrap_or(json!(null)))
+}
+
+fn code_action_handler(
+    id: RequestId,
+    params: CodeActionParams,
+    class_map: &ClassMap,
+    documents: &DocumentMap,
+) -> Response {
+    let html_uri = &params.text_document.uri;
+    let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+
+    for diag in &params.context.diagnostics {
+        if diag.source.as_deref() != Some("css-class-mapper") {
+            continue;
+        }
+        if diag.severity != Some(DiagnosticSeverity::ERROR) {
+            continue;
+        }
+
+        // Extract selector name from message: "Unknown CSS class 'foo'" or "Unknown CSS id 'bar'".
+        let msg = &diag.message;
+        let is_id = msg.contains("Unknown CSS id");
+        let name = match extract_quoted(msg) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let target_css = match find_target_css_file(html_uri, class_map) {
+            Some(p) => p,
+            None => continue,
+        };
+        let css_uri = match Url::from_file_path(&target_css) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+
+        let css_content = fs::read_to_string(&target_css).unwrap_or_default();
+        let last_line = css_content.lines().count() as u32;
+        let needs_newline = !css_content.ends_with('\n');
+        let prefix = if is_id { "#" } else { "." };
+        let new_rule = format!(
+            "{}{prefix}{name} {{\n  \n}}\n",
+            if needs_newline { "\n" } else { "" }
+        );
+        let file_name = target_css
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("CSS file");
+
+        let action = CodeAction {
+            title: format!(
+                "Create CSS {}{}{name} in {file_name}",
+                if is_id { "id " } else { "class " },
+                prefix
+            ),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diag.clone()]),
+            is_preferred: Some(true),
+            edit: Some(WorkspaceEdit {
+                changes: Some(HashMap::from([(
+                    css_uri,
+                    vec![TextEdit {
+                        range: Range {
+                            start: Position { line: last_line, character: 0 },
+                            end: Position { line: last_line, character: 0 },
+                        },
+                        new_text: new_rule,
+                    }],
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        actions.push(CodeActionOrCommand::CodeAction(action));
+
+        // If the document is open but not saved, also offer an in-memory preview
+        // by checking for any CSS document open. (Best-effort only.)
+        let _ = documents;
+    }
+
+    Response::new_ok(id, serde_json::to_value(actions).unwrap_or(json!([])))
+}
+
 // ---------------------------------------------------------------------------
-// Context detection — are we inside class="..." or id="..."?
+// Context detection
 // ---------------------------------------------------------------------------
 
 fn in_class_attribute(text: &str, pos: Position) -> bool {
@@ -524,6 +832,10 @@ fn in_class_attribute(text: &str, pos: Position) -> bool {
 
 fn in_id_attribute(text: &str, pos: Position) -> bool {
     in_attr(text, pos, id_attr_re())
+}
+
+fn in_style_attribute(text: &str, pos: Position) -> bool {
+    in_attr(text, pos, style_attr_re())
 }
 
 fn in_attr(text: &str, pos: Position, attr_re: &Regex) -> bool {
@@ -552,9 +864,36 @@ fn in_attr(text: &str, pos: Position, attr_re: &Regex) -> bool {
     }
 }
 
-/// Returns the completion context for a `class="..."` attribute:
-/// the set of already-present class names (lowercased, excluding the partial
-/// word at the cursor) and the partial word being typed.
+/// Returns the CSS identifier fragment immediately before the cursor within a
+/// `style="..."` attribute value. Used to detect `--variable` prefixes.
+fn style_prefix(text: &str, pos: Position) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let line_idx = pos.line as usize;
+    if line_idx >= lines.len() {
+        return String::new();
+    }
+    let col = (pos.character as usize).min(lines[line_idx].len());
+
+    let mut before = String::new();
+    for (i, l) in lines.iter().enumerate() {
+        if i < line_idx {
+            before.push_str(l);
+            before.push('\n');
+        } else {
+            before.push_str(&l[..col]);
+            break;
+        }
+    }
+
+    let last_match = match style_attr_re().captures_iter(&before).last() {
+        Some(m) => m,
+        None => return String::new(),
+    };
+
+    let value_start = last_match.get(0).unwrap().end();
+    extract_prefix(&before[value_start..])
+}
+
 fn completion_context(text: &str, pos: Position) -> (HashSet<String>, String) {
     let lines: Vec<&str> = text.lines().collect();
     let line_idx = pos.line as usize;
@@ -583,9 +922,7 @@ fn completion_context(text: &str, pos: Position) -> (HashSet<String>, String) {
     let quote = last_match[1].chars().next().unwrap_or('"');
     let attr_value_start = last_match.get(0).unwrap().end();
     let value_before_cursor = &before[attr_value_start..];
-
     let prefix = extract_prefix(value_before_cursor);
-
     let value_after = line[col..].splitn(2, quote).next().unwrap_or("");
     let full_value = format!("{value_before_cursor}{value_after}");
 
@@ -599,9 +936,6 @@ fn completion_context(text: &str, pos: Position) -> (HashSet<String>, String) {
     (existing, prefix)
 }
 
-/// Returns `(has_existing_value, prefix)` for an `id="..."` attribute.
-/// `has_existing_value` is true when a complete word other than the current
-/// prefix already occupies the attribute — callers should suppress completions.
 fn id_completion_context(text: &str, pos: Position) -> (bool, String) {
     let lines: Vec<&str> = text.lines().collect();
     let line_idx = pos.line as usize;
@@ -630,7 +964,6 @@ fn id_completion_context(text: &str, pos: Position) -> (bool, String) {
     let quote = last_match[1].chars().next().unwrap_or('"');
     let attr_value_start = last_match.get(0).unwrap().end();
     let value_before_cursor = &before[attr_value_start..];
-
     let prefix = extract_prefix(value_before_cursor);
     let value_after = line[col..].splitn(2, quote).next().unwrap_or("");
     let full_value = format!("{value_before_cursor}{value_after}");
@@ -643,7 +976,6 @@ fn id_completion_context(text: &str, pos: Position) -> (bool, String) {
     (has_existing, prefix)
 }
 
-/// Returns the CSS identifier fragment immediately before the end of `s`.
 fn extract_prefix(s: &str) -> String {
     let bytes = s.as_bytes();
     let end = bytes.len();
@@ -658,8 +990,6 @@ fn extract_prefix(s: &str) -> String {
     s[start..].to_string()
 }
 
-/// Determines the insert text for a class completion, adding spacing when the
-/// cursor is flush against existing class names.
 fn build_insert_text(name: &str, text: &str, pos: Position) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let line_idx = pos.line as usize;
@@ -684,7 +1014,6 @@ fn build_insert_text(name: &str, text: &str, pos: Position) -> String {
     }
 }
 
-/// Returns the CSS identifier word at `pos`.
 fn word_at(text: &str, pos: Position) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     let line_idx = pos.line as usize;
@@ -721,8 +1050,9 @@ fn is_ident_byte(b: u8) -> bool {
 // CSS parsing
 // ---------------------------------------------------------------------------
 
-/// Walks `root` recursively and parses every `.css` file found.
-/// Symlinks are NOT followed. `node_modules` and hidden directories are skipped.
+/// Skips CSS files larger than 500 KB to avoid stalling on minified files.
+const MAX_CSS_BYTES: u64 = 500 * 1024;
+
 fn scan_directory(root: &Path, class_map: &mut ClassMap) {
     for entry in WalkDir::new(root)
         .follow_links(false)
@@ -738,14 +1068,17 @@ fn scan_directory(root: &Path, class_map: &mut ClassMap) {
     }
 }
 
-/// Reads a CSS file and merges its selectors into `class_map`, following
-/// `@import` statements recursively. Uses `visited` to prevent cycles.
 fn parse_css_file(path: &Path, class_map: &mut ClassMap) {
     let mut visited: HashSet<PathBuf> = HashSet::new();
     parse_css_file_inner(path, class_map, &mut visited);
 }
 
 fn parse_css_file_inner(path: &Path, class_map: &mut ClassMap, visited: &mut HashSet<PathBuf>) {
+    // Skip files that are too large (e.g. minified bundles).
+    if fs::metadata(path).map(|m| m.len()).unwrap_or(0) > MAX_CSS_BYTES {
+        return;
+    }
+
     let canonical = match path.canonicalize() {
         Ok(p) => p,
         Err(_) => return,
@@ -779,14 +1112,6 @@ fn parse_css_content(content: &str, source_file: &str, source_path: &str, class_
     parse_rules_at_level(&stripped, 0, None, source_file, source_path, class_map);
 }
 
-/// Recursively walks a CSS block, extracting class and ID selectors.
-///
-/// `base_line` is the 0-based line offset of `content` within the original
-/// file, used to produce accurate definition line numbers after recursing into
-/// `@media` / `@supports` blocks.
-///
-/// Keys for classes are stored as bare names (`btn`); keys for IDs include the
-/// leading `#` (`#hero`) so they live in the same map without collision.
 fn parse_rules_at_level(
     content: &str,
     base_line: u32,
@@ -801,51 +1126,36 @@ fn parse_rules_at_level(
 
     while i < bytes.len() {
         match bytes[i] {
-            // Skip string literals so braces inside them don't confuse the parser.
             b'"' | b'\'' => {
                 let quote = bytes[i];
                 i += 1;
                 while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 1; // skip escaped character
-                    } else if bytes[i] == quote {
-                        break;
-                    }
+                    if bytes[i] == b'\\' { i += 1; }
+                    else if bytes[i] == quote { break; }
                     i += 1;
                 }
                 i += 1;
             }
-
-            // A semicolon ends single-line @-rules (@charset, @import, @namespace).
-            // Reset the accumulator so the following selector text is clean.
             b';' => {
                 i += 1;
                 chunk_start = i;
             }
-
             b'{' => {
                 let raw_chunk = &content[chunk_start..i];
                 let pending = raw_chunk.trim();
 
                 if pending.starts_with('@') {
-                    // Determine whether this @-rule carries a media query context.
                     let is_conditional = pending.starts_with("@media")
                         || pending.starts_with("@supports");
-                    let child_mq = if is_conditional {
-                        Some(pending)
-                    } else {
-                        media_query // @layer, @container, etc. inherit parent context
-                    };
+                    let child_mq = if is_conditional { Some(pending) } else { media_query };
 
-                    // Find the matching closing brace.
                     let block_start = i + 1;
                     i = advance_past_block(bytes, i + 1);
                     let block = &content[block_start..i];
                     let block_base = base_line + byte_offset_to_line(content, block_start);
                     parse_rules_at_level(block, block_base, child_mq, source_file, source_path, class_map);
-                    i += 1; // skip the closing `}`
+                    i += 1;
                 } else if !pending.is_empty() {
-                    // Regular CSS rule: collect properties up to the matching `}`.
                     let trim_offset = raw_chunk.len() - raw_chunk.trim_start().len();
                     let definition_line = base_line + byte_offset_to_line(content, chunk_start + trim_offset);
 
@@ -856,28 +1166,21 @@ fn parse_rules_at_level(
                     if !properties.is_empty() {
                         process_selector(pending, properties, definition_line, media_query, source_file, source_path, class_map);
                     }
-                    i += 1; // skip the closing `}`
+                    i += 1;
                 } else {
                     i += 1;
                 }
                 chunk_start = i;
             }
-
             b'}' => {
-                // Stray closing brace — reset accumulator.
                 i += 1;
                 chunk_start = i;
             }
-
-            _ => {
-                i += 1;
-            }
+            _ => { i += 1; }
         }
     }
 }
 
-/// Advances `i` past a `{...}` block (handling nesting and string literals),
-/// stopping with `i` pointing at the matching `}`.
 fn advance_past_block(bytes: &[u8], mut i: usize) -> usize {
     let mut depth = 1usize;
     while i < bytes.len() && depth > 0 {
@@ -886,20 +1189,15 @@ fn advance_past_block(bytes: &[u8], mut i: usize) -> usize {
                 let q = bytes[i];
                 i += 1;
                 while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    } else if bytes[i] == q {
-                        break;
-                    }
+                    if bytes[i] == b'\\' { i += 1; }
+                    else if bytes[i] == q { break; }
                     i += 1;
                 }
             }
             b'{' => depth += 1,
             b'}' => {
                 depth -= 1;
-                if depth == 0 {
-                    return i;
-                }
+                if depth == 0 { return i; }
             }
             _ => {}
         }
@@ -908,8 +1206,6 @@ fn advance_past_block(bytes: &[u8], mut i: usize) -> usize {
     i
 }
 
-/// Extracts class and ID selectors from `selector_raw` and inserts them into
-/// `class_map`. Classes are keyed by bare name; IDs include the leading `#`.
 fn process_selector(
     selector_raw: &str,
     properties: &str,
@@ -923,7 +1219,7 @@ fn process_selector(
     let selector_display = selector.trim().to_string();
 
     for m in class_re().find_iter(&selector) {
-        let name = m.as_str()[1..].to_string(); // strip leading `.`
+        let name = m.as_str()[1..].to_string();
         class_map.entry(name).or_default().push(ClassInfo {
             properties: properties.to_string(),
             selector: selector_display.clone(),
@@ -935,7 +1231,7 @@ fn process_selector(
     }
 
     for m in id_re().find_iter(&selector) {
-        let name = m.as_str().to_string(); // keep the `#` as part of the key
+        let name = m.as_str().to_string();
         class_map.entry(name).or_default().push(ClassInfo {
             properties: properties.to_string(),
             selector: selector_display.clone(),
@@ -947,29 +1243,19 @@ fn process_selector(
     }
 }
 
-/// Extracts local @import paths from CSS content.
-/// Skips URL imports (http/https/protocol-relative).
 fn extract_imports(content: &str) -> Vec<String> {
     import_re()
         .captures_iter(content)
         .filter_map(|cap| cap.get(1))
         .map(|m| m.as_str().to_string())
-        .filter(|p| {
-            !p.starts_with("http://")
-                && !p.starts_with("https://")
-                && !p.starts_with("//")
-        })
+        .filter(|p| !p.starts_with("http://") && !p.starts_with("https://") && !p.starts_with("//"))
         .map(|mut p| {
-            if !p.contains('.') {
-                p.push_str(".css");
-            }
+            if !p.contains('.') { p.push_str(".css"); }
             p
         })
         .collect()
 }
 
-/// Strips CSS block comments while preserving newlines so that line numbers
-/// in the stripped content match the original file.
 fn strip_comments(content: &str) -> String {
     let mut result = String::with_capacity(content.len());
     let mut chars = content.chars().peekable();
@@ -1000,7 +1286,6 @@ fn strip_comments(content: &str) -> String {
     result
 }
 
-/// Returns the 0-based line number of `offset` within `content`.
 fn byte_offset_to_line(content: &str, offset: usize) -> u32 {
     content[..offset.min(content.len())]
         .bytes()
@@ -1008,23 +1293,15 @@ fn byte_offset_to_line(content: &str, offset: usize) -> u32 {
         .count() as u32
 }
 
-// ---------------------------------------------------------------------------
-// File watcher — incremental CSS map updates
-// ---------------------------------------------------------------------------
-
-/// Handles `workspace/didChangeWatchedFiles`. Only the affected file is
-/// re-parsed; the rest of the map is untouched.
 fn update_css_map(params: &DidChangeWatchedFilesParams, class_map: &mut ClassMap) {
     for change in &params.changes {
         let path: PathBuf = match change.uri.to_file_path() {
             Ok(p) => p,
             Err(_) => continue,
         };
-
         if path.extension().map_or(true, |e| e != "css") {
             continue;
         }
-
         let source_path = path.to_string_lossy().into_owned();
 
         for infos in class_map.values_mut() {
@@ -1036,6 +1313,129 @@ fn update_css_map(params: &DidChangeWatchedFilesParams, class_map: &mut ClassMap
             parse_css_file(&path, class_map);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// CSS variable map
+// ---------------------------------------------------------------------------
+
+/// Rebuilds the CSS variable map from all property blobs in `class_map`.
+/// Variables are discovered as `--name: value` lines inside any rule.
+fn refresh_var_map(class_map: &ClassMap) -> VarMap {
+    let mut vars = HashMap::new();
+    for infos in class_map.values() {
+        for info in infos {
+            for line in info.properties.lines() {
+                let line = line.trim().trim_end_matches(';').trim();
+                if let Some(rest) = line.strip_prefix("--") {
+                    if let Some(colon) = rest.find(':') {
+                        let name = format!("--{}", rest[..colon].trim());
+                        let value = rest[colon + 1..].trim().to_string();
+                        if !value.is_empty() {
+                            vars.entry(name).or_insert(value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    vars
+}
+
+// ---------------------------------------------------------------------------
+// Workspace HTML scanning (references + rename)
+// ---------------------------------------------------------------------------
+
+/// Returns all locations in workspace HTML files where `lookup_key` is used as
+/// a class name (bare) or an ID value (`#`-prefixed key → bare in attribute).
+fn workspace_html_refs(
+    lookup_key: &str,
+    root: &Path,
+    documents: &DocumentMap,
+) -> Vec<Location> {
+    let is_id = lookup_key.starts_with('#');
+    let bare = if is_id { &lookup_key[1..] } else { lookup_key };
+    let mut locs = Vec::new();
+
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            let n = e.file_name().to_str().unwrap_or("");
+            n != "node_modules" && !n.starts_with('.')
+        })
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            matches!(
+                e.path().extension().and_then(|s| s.to_str()),
+                Some("html") | Some("htm")
+            )
+        })
+    {
+        let path = entry.path();
+        let uri = match Url::from_file_path(path) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+
+        let owned;
+        let text: &str = if let Some(t) = documents.get(&uri) {
+            t
+        } else {
+            match fs::read_to_string(path) {
+                Ok(t) => { owned = t; &owned }
+                Err(_) => continue,
+            }
+        };
+
+        for r in html_selector_refs(text) {
+            if r.is_id == is_id && r.name == bare {
+                locs.push(Location {
+                    uri: uri.clone(),
+                    range: Range {
+                        start: Position { line: r.line, character: r.col_start },
+                        end: Position { line: r.line, character: r.col_end },
+                    },
+                });
+            }
+        }
+    }
+
+    locs
+}
+
+// ---------------------------------------------------------------------------
+// Code action helpers
+// ---------------------------------------------------------------------------
+
+/// Extracts the single-quoted name from a message like `"Unknown CSS class 'btn'"`.
+fn extract_quoted(msg: &str) -> Option<String> {
+    let start = msg.find('\'')? + 1;
+    let end = msg.rfind('\'')?;
+    if end <= start { return None; }
+    Some(msg[start..end].to_string())
+}
+
+/// Returns the CSS file path that is most likely the right target for a new
+/// rule: prefers a file in the same directory as the HTML file, then any file.
+fn find_target_css_file(html_uri: &Url, class_map: &ClassMap) -> Option<PathBuf> {
+    let html_dir = html_uri.to_file_path().ok()?.parent()?.to_path_buf();
+
+    let css_paths: HashSet<&str> = class_map
+        .values()
+        .flat_map(|v| v.iter().map(|i| i.source_path.as_str()))
+        .collect();
+
+    // Prefer same directory.
+    for s in &css_paths {
+        let p = Path::new(s);
+        if p.parent() == Some(&html_dir) {
+            return Some(p.to_path_buf());
+        }
+    }
+
+    // Fall back to any known CSS file.
+    css_paths.iter().next().map(|s| PathBuf::from(s))
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,7 +1459,6 @@ fn publish_diagnostics(uri: Url, diagnostics: Vec<Diagnostic>) -> lsp_server::No
     }
 }
 
-/// A reference to a class name or ID name found in an HTML attribute.
 struct SelectorRef {
     line: u32,
     col_start: u32,
@@ -1068,8 +1467,6 @@ struct SelectorRef {
     is_id: bool,
 }
 
-/// Scans `text` for class and ID attribute values and returns a reference for
-/// every token found. Handles both `class="a b"` and `id="foo"` forms.
 fn html_selector_refs(text: &str) -> Vec<SelectorRef> {
     let mut refs = Vec::new();
     for (line_num, line) in text.lines().enumerate() {
@@ -1088,14 +1485,11 @@ fn collect_attr_refs(
 ) {
     for cap in attr_re.captures_iter(line) {
         let quote = cap[1].chars().next().unwrap_or('"');
-        let value_start = cap.get(0).unwrap().end(); // byte offset after the opening quote
+        let value_start = cap.get(0).unwrap().end();
         let rest = &line[value_start..];
-
-        // Find closing quote on the same line (multi-line attributes are rare; skip them).
         let value_len = rest.find(quote).unwrap_or(rest.len());
         let value = &rest[..value_len];
 
-        // Extract each whitespace-separated token and its column positions.
         let mut tok_start = 0usize;
         for (i, &b) in value.as_bytes().iter().enumerate() {
             if b == b' ' || b == b'\t' {
@@ -1123,17 +1517,11 @@ fn collect_attr_refs(
     }
 }
 
-/// Returns error diagnostics for every class or ID referenced in `text` that
-/// does not exist in `class_map`.
 fn diagnostics_for_html(text: &str, class_map: &ClassMap) -> Vec<Diagnostic> {
     html_selector_refs(text)
         .into_iter()
         .filter_map(|r| {
-            let lookup = if r.is_id {
-                format!("#{}", r.name)
-            } else {
-                r.name.clone()
-            };
+            let lookup = if r.is_id { format!("#{}", r.name) } else { r.name.clone() };
             if class_map.contains_key(&lookup) {
                 return None;
             }
@@ -1152,28 +1540,14 @@ fn diagnostics_for_html(text: &str, class_map: &ClassMap) -> Vec<Diagnostic> {
         .collect()
 }
 
-/// Returns warning diagnostics for every class or ID that is defined more than
-/// once within `source_path`. The first definition is silently accepted; each
-/// subsequent one is flagged.
 fn diagnostics_for_css_duplicates(class_map: &ClassMap, source_path: &str) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
     for (name, infos) in class_map {
-        let in_file: Vec<_> = infos
-            .iter()
-            .filter(|i| i.source_path == source_path)
-            .collect();
+        let in_file: Vec<_> = infos.iter().filter(|i| i.source_path == source_path).collect();
+        if in_file.len() <= 1 { continue; }
 
-        if in_file.len() <= 1 {
-            continue;
-        }
-
-        let display = if name.starts_with('#') {
-            name.clone()
-        } else {
-            format!(".{name}")
-        };
-
+        let display = if name.starts_with('#') { name.clone() } else { format!(".{name}") };
         for info in &in_file[1..] {
             diags.push(Diagnostic {
                 range: Range {
@@ -1191,16 +1565,77 @@ fn diagnostics_for_css_duplicates(class_map: &ClassMap, source_path: &str) -> Ve
     diags
 }
 
+/// Returns hint-level diagnostics for CSS selectors that are not referenced in
+/// any currently-open HTML document. Callers should decide whether to surface
+/// these (they are intentionally soft — JS-driven classes will appear unused).
+fn diagnostics_for_unused(
+    class_map: &ClassMap,
+    documents: &DocumentMap,
+) -> HashMap<Url, Vec<Diagnostic>> {
+    // Collect all selectors used in open HTML documents.
+    let mut used: HashSet<String> = HashSet::new();
+    for (uri, text) in documents {
+        if !is_html_uri(uri) { continue; }
+        for r in html_selector_refs(text) {
+            let key = if r.is_id { format!("#{}", r.name) } else { r.name };
+            used.insert(key);
+        }
+    }
+
+    // If no HTML files are open, don't emit any hints — we have no evidence.
+    if used.is_empty() { return HashMap::new(); }
+
+    let mut out: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
+
+    for (name, infos) in class_map {
+        if used.contains(name) { continue; }
+        let display = if name.starts_with('#') { name.clone() } else { format!(".{name}") };
+
+        for info in infos {
+            let uri = match Url::from_file_path(&info.source_path) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            out.entry(uri).or_default().push(Diagnostic {
+                range: Range {
+                    start: Position { line: info.definition_line, character: 0 },
+                    end: Position { line: info.definition_line, character: 0 },
+                },
+                severity: Some(DiagnosticSeverity::HINT),
+                source: Some("css-class-mapper".to_string()),
+                message: format!("'{display}' is not used in any open HTML file"),
+                ..Default::default()
+            });
+        }
+    }
+
+    out
+}
+
 // ---------------------------------------------------------------------------
-// Specificity
+// Hover helpers
 // ---------------------------------------------------------------------------
 
-/// Computes the CSS specificity `(a, b, c)` for the first selector in a
-/// comma-separated list. `a` = ID count, `b` = class count, `c` = 0 (type
-/// selectors are not tracked in our simplified selector model).
 fn specificity(selector: &str) -> (u32, u32, u32) {
     let part = selector.split(',').next().unwrap_or(selector);
     let a = id_re().find_iter(part).count() as u32;
     let b = class_re().find_iter(part).count() as u32;
     (a, b, 0)
 }
+
+/// Returns a formatted string of unique color values found in `properties`.
+fn color_summary(properties: &str) -> String {
+    let mut seen: IndexedSet = Vec::new();
+    for m in color_re().find_iter(properties) {
+        let v = m.as_str().to_string();
+        if !seen.contains(&v) {
+            seen.push(v);
+        }
+    }
+    seen.into_iter()
+        .map(|c| format!("`{c}`"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+type IndexedSet = Vec<String>;
