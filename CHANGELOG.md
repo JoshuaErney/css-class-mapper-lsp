@@ -8,6 +8,25 @@ Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
 
 ---
 
+## [0.3.0] — 2026-06-09
+
+### Added
+- **Full selector in hover** — hover tooltips now show the complete selector
+  (e.g. `.btn.btn--primary`) instead of just the bare class name
+- **Line numbers in hover** — hover tooltips now include the source line number
+  (e.g. `styles.css:42`)
+- **All definitions in hover** — when a class is defined in more than one file,
+  hover lists every definition numbered with its file, line, and CSS block
+- **Multi-location go-to-definition** — when a class has multiple definitions,
+  go-to-definition returns all locations so the editor presents a picker
+
+### Fixed
+- **Last-write-wins bug** — if the same class name appeared in multiple CSS
+  files, only the last parsed definition was kept; all definitions are now
+  preserved and surfaced in hover and go-to-definition
+
+---
+
 ## [0.2.0] — 2026-06-08
 
 ### Added

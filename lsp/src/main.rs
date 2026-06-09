@@ -47,6 +47,8 @@ fn import_re() -> &'static Regex {
 struct ClassInfo {
     /// Raw property declarations inside the `{ }` block (trimmed).
     properties: String,
+    /// Full selector string (pseudos stripped) this class was found in, e.g. `.btn.btn--primary`.
+    selector: String,
     /// Basename of the CSS file — used for display only (e.g. "styles.css").
     source_file: String,
     /// Full canonical path — used to remove stale entries when a file changes.
@@ -55,7 +57,7 @@ struct ClassInfo {
     definition_line: u32,
 }
 
-type ClassMap = HashMap<String, ClassInfo>;
+type ClassMap = HashMap<String, Vec<ClassInfo>>;
 type DocumentMap = HashMap<Url, String>;
 
 // ---------------------------------------------------------------------------
@@ -246,13 +248,14 @@ fn completion_handler(
                 // Case-insensitive prefix match against what's been typed so far.
                 && (prefix.is_empty() || name_lower.starts_with(&prefix_lower))
         })
-        .map(|(name, info)| {
+        .map(|(name, infos)| {
             // Determine correct spacing around the inserted class name.
             let insert = build_insert_text(name, text, pos);
+            let detail = infos.first().map(|i| i.source_file.clone());
             CompletionItem {
                 label: name.clone(),
                 kind: Some(CompletionItemKind::CLASS),
-                detail: Some(info.source_file.clone()),
+                detail,
                 insert_text: Some(insert),
                 // filter_text is the label lowercased so the editor's own
                 // filtering also behaves case-insensitively.
@@ -292,15 +295,35 @@ fn hover_handler(
         None => return Response::new_ok(id, json!(null)),
     };
 
-    let info = match class_map.get(&class_name) {
-        Some(i) => i,
-        None => return Response::new_ok(id, json!(null)),
+    let infos = match class_map.get(&class_name) {
+        Some(v) if !v.is_empty() => v,
+        _ => return Response::new_ok(id, json!(null)),
     };
 
-    let markdown = format!(
-        "**{}** — {}\n\n```css\n.{} {{\n{}\n}}\n```",
-        class_name, info.source_file, class_name, info.properties
-    );
+    let markdown = if infos.len() == 1 {
+        let info = &infos[0];
+        format!(
+            "**{}** — {}:{}\n\n```css\n{} {{\n{}\n}}\n```",
+            class_name,
+            info.source_file,
+            info.definition_line + 1,
+            info.selector,
+            info.properties
+        )
+    } else {
+        let mut parts = vec![format!("**{}** — {} definitions\n", class_name, infos.len())];
+        for (i, info) in infos.iter().enumerate() {
+            parts.push(format!(
+                "**{}.** {}:{}\n```css\n{} {{\n{}\n}}\n```",
+                i + 1,
+                info.source_file,
+                info.definition_line + 1,
+                info.selector,
+                info.properties
+            ));
+        }
+        parts.join("\n\n")
+    };
 
     let hover = Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -336,32 +359,40 @@ fn definition_handler(
         None => return Response::new_ok(id, json!(null)),
     };
 
-    let info = match class_map.get(&class_name) {
-        Some(i) => i,
-        None => return Response::new_ok(id, json!(null)),
+    let infos = match class_map.get(&class_name) {
+        Some(v) if !v.is_empty() => v,
+        _ => return Response::new_ok(id, json!(null)),
     };
 
-    let def_uri = match Url::from_file_path(&info.source_path) {
-        Ok(u) => u,
-        Err(_) => return Response::new_ok(id, json!(null)),
-    };
+    let locations: Vec<Location> = infos
+        .iter()
+        .filter_map(|info| {
+            let uri = Url::from_file_path(&info.source_path).ok()?;
+            Some(Location {
+                uri,
+                range: Range {
+                    start: Position {
+                        line: info.definition_line,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: info.definition_line,
+                        character: 0,
+                    },
+                },
+            })
+        })
+        .collect();
 
-    let location = Location {
-        uri: def_uri,
-        range: Range {
-            start: Position {
-                line: info.definition_line,
-                character: 0,
-            },
-            end: Position {
-                line: info.definition_line,
-                character: 0,
-            },
-        },
+    let result = match locations.len() {
+        0 => json!(null),
+        1 => serde_json::to_value(GotoDefinitionResponse::Scalar(
+            locations.into_iter().next().unwrap(),
+        ))
+        .unwrap_or(json!(null)),
+        _ => serde_json::to_value(GotoDefinitionResponse::Array(locations))
+            .unwrap_or(json!(null)),
     };
-
-    let result = serde_json::to_value(GotoDefinitionResponse::Scalar(location))
-        .unwrap_or(json!(null));
     Response::new_ok(id, result)
 }
 
@@ -685,19 +716,21 @@ fn parse_css_content(
         let definition_line = byte_offset_to_line(&stripped, rule_offset + ws_skip);
 
         let selector = pseudo_re().replace_all(selector_raw, "");
+        let selector_display = selector.trim().to_string();
 
         for class_match in class_re().find_iter(&selector) {
             let name = &class_match.as_str()[1..]; // strip leading `.`
 
-            class_map.insert(
-                name.to_string(),
-                ClassInfo {
+            class_map
+                .entry(name.to_string())
+                .or_default()
+                .push(ClassInfo {
                     properties: properties.clone(),
+                    selector: selector_display.clone(),
                     source_file: source_file.to_string(),
                     source_path: source_path.to_string(),
                     definition_line,
-                },
-            );
+                });
         }
     }
 }
@@ -721,7 +754,10 @@ fn update_css_map(params: &DidChangeWatchedFilesParams, class_map: &mut ClassMap
 
         let source_path = path.to_string_lossy().into_owned();
 
-        class_map.retain(|_, info| info.source_path != source_path);
+        for infos in class_map.values_mut() {
+            infos.retain(|info| info.source_path != source_path);
+        }
+        class_map.retain(|_, infos| !infos.is_empty());
 
         if change.typ == FileChangeType::CREATED || change.typ == FileChangeType::CHANGED {
             parse_css_file(&path, class_map);

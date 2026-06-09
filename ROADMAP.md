@@ -9,7 +9,7 @@ Checked items have been shipped — see [CHANGELOG.md](CHANGELOG.md) for details
 
 - [x] Handle `@import` — follow imported CSS files automatically *(v0.2.0)*
 - [ ] Support `@media` — capture which breakpoint a class lives in
-- [ ] Handle multiple definitions of the same class across files
+- [x] Handle multiple definitions of the same class across files *(v0.3.0)*
 - [ ] Extract ID selectors (`#id`) alongside class selectors
 
 ---
@@ -32,11 +32,11 @@ Checked items have been shipped — see [CHANGELOG.md](CHANGELOG.md) for details
 
 ## Hover Tooltips
 
-- [ ] Show the full original selector (`.btn.btn--primary`) not just the class name
+- [x] Show the full original selector (`.btn.btn--primary`) not just the class name *(v0.3.0)*
 - [x] Show which file the rule comes from *(v0.1.0)*
-- [ ] Show which line number the rule comes from
+- [x] Show which line number the rule comes from *(v0.3.0)*
 - [ ] Show the media query context if the rule is inside one (`@media (max-width: 768px)`)
-- [ ] Show all definitions when multiple files define the same class or ID
+- [x] Show all definitions when multiple files define the same class or ID *(v0.3.0)*
 - [ ] Expand shorthand properties (`margin: 8px 16px` → all four sides)
 - [ ] Color swatches next to color values
 - [ ] Show computed specificity score — IDs score `(1,0,0)`, classes `(0,1,0)`
@@ -85,7 +85,3 @@ Checked items have been shipped — see [CHANGELOG.md](CHANGELOG.md) for details
 - [ ] Cap file size — skip CSS files over a configurable limit to handle minified files
 
 ---
-
-## Distribution
-
-- [ ] GitHub Actions workflow to auto-compile and publish release assets on new tags
