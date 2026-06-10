@@ -129,6 +129,29 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     connection.initialize_finish(init_id, serde_json::to_value(init_result)?)?;
 
+    // Register a file watcher for CSS files so the client sends
+    // workspace/didChangeWatchedFiles when any .css file is saved.
+    let register_params = RegistrationParams {
+        registrations: vec![Registration {
+            id: "css-class-mapper-css-watcher".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: Some(
+                serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                    watchers: vec![FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/*.css".to_string()),
+                        kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+                    }],
+                })
+                .unwrap_or(json!({})),
+            ),
+        }],
+    };
+    connection.sender.send(Message::Request(lsp_server::Request {
+        id: RequestId::from(0i32),
+        method: "client/registerCapability".to_string(),
+        params: serde_json::to_value(register_params).unwrap_or(json!({})),
+    }))?;
+
     let mut documents: DocumentMap = HashMap::new();
 
     loop {

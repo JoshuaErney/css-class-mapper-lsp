@@ -8,6 +8,17 @@ Format: [Semantic Versioning](https://semver.org) — `MAJOR.MINOR.PATCH`
 
 ---
 
+## [0.7.1] — 2026-06-09
+
+### Fixed
+- **Stale "Unknown CSS class" after save** — the LSP server now registers a
+  `workspace/didChangeWatchedFiles` file watcher for `**/*.css` during
+  initialization; previously no watcher was registered so the editor never
+  notified the server when a CSS file was saved, leaving the class map and HTML
+  diagnostics permanently stale until the LSP was restarted
+
+---
+
 ## [0.7.0] — 2026-06-09
 
 ### Fixed
