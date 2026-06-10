@@ -219,7 +219,7 @@ fn route_request(
         }
         "textDocument/codeAction" => {
             match serde_json::from_value::<CodeActionParams>(params.clone()) {
-                Ok(p) => code_action_handler(id, p, class_map, documents),
+                Ok(p) => code_action_handler(id, p, class_map),
                 Err(e) => Response::new_err(id, -32602, e.to_string()),
             }
         }
@@ -344,6 +344,11 @@ fn completion_handler(
     if in_class_attribute(text, pos) {
         let (existing_classes, prefix) = completion_context(text, pos);
         let prefix_lower = prefix.to_lowercase();
+        // Compute line/col once; build_insert_text no longer calls cursor_context
+        // per candidate (which was O(candidates × pos.line) work).
+        let (ins_line, ins_col) = cursor_context(text, pos)
+            .map(|(_, l, c)| (l, c))
+            .unwrap_or(("", 0));
 
         let mut items: Vec<CompletionItem> = class_map
             .iter()
@@ -354,7 +359,7 @@ fn completion_handler(
                     && (prefix.is_empty() || name_lower.starts_with(&prefix_lower))
             })
             .map(|(name, infos)| {
-                let insert = build_insert_text(name, text, pos);
+                let insert = build_insert_text(name, ins_line, ins_col);
                 let detail = infos.first().map(|i| i.source_file.clone());
                 CompletionItem {
                     label: name.clone(),
@@ -656,6 +661,14 @@ fn rename_handler(
     let pos = params.text_document_position.position;
     let new_name = &params.new_name;
 
+    if !is_valid_css_ident(new_name) {
+        return Response::new_err(
+            id,
+            -32602,
+            format!("'{new_name}' is not a valid CSS identifier"),
+        );
+    }
+
     let text = match documents.get(uri) {
         Some(t) => t,
         None => return Response::new_ok(id, json!(null)),
@@ -702,6 +715,12 @@ fn rename_handler(
             // Replace the first occurrence on the selector line (before any `{`).
             let selector_part = line_text.split('{').next().unwrap_or(line_text);
             if let Some(col) = selector_part.find(&old_pattern) {
+                // Guard: ensure the match is a complete token, not a prefix of a
+                // longer name (e.g. renaming .btn must not touch .btn-primary).
+                let after = col + old_pattern.len();
+                if selector_part.as_bytes().get(after).is_some_and(|&b| is_ident_byte(b)) {
+                    continue;
+                }
                 changes.entry(css_uri).or_default().push(TextEdit {
                     range: Range {
                         start: Position {
@@ -745,7 +764,6 @@ fn code_action_handler(
     id: RequestId,
     params: CodeActionParams,
     class_map: &ClassMap,
-    documents: &DocumentMap,
 ) -> Response {
     let html_uri = &params.text_document.uri;
     let mut actions: Vec<CodeActionOrCommand> = Vec::new();
@@ -761,9 +779,10 @@ fn code_action_handler(
         // Extract selector name from message: "Unknown CSS class 'foo'" or "Unknown CSS id 'bar'".
         let msg = &diag.message;
         let is_id = msg.contains("Unknown CSS id");
+        // Guard against CSS injection — only proceed if the name is a safe identifier.
         let name = match extract_quoted(msg) {
-            Some(n) => n,
-            None => continue,
+            Some(n) if is_valid_css_ident(&n) => n,
+            _ => continue,
         };
 
         let target_css = match find_target_css_file(html_uri, class_map) {
@@ -813,10 +832,6 @@ fn code_action_handler(
             ..Default::default()
         };
         actions.push(CodeActionOrCommand::CodeAction(action));
-
-        // If the document is open but not saved, also offer an in-memory preview
-        // by checking for any CSS document open. (Best-effort only.)
-        let _ = documents;
     }
 
     Response::new_ok(id, serde_json::to_value(actions).unwrap_or(json!([])))
@@ -839,80 +854,70 @@ fn in_style_attribute(text: &str, pos: Position) -> bool {
 }
 
 fn in_attr(text: &str, pos: Position, attr_re: &Regex) -> bool {
-    let lines: Vec<&str> = text.lines().collect();
-    let line_idx = pos.line as usize;
-    if line_idx >= lines.len() {
-        return false;
-    }
-    let mut before = String::new();
-    for (i, line) in lines.iter().enumerate() {
-        if i < line_idx {
-            before.push_str(line);
-            before.push('\n');
-        } else {
-            let col = (pos.character as usize).min(line.len());
-            before.push_str(&line[..col]);
-            break;
-        }
-    }
+    let (before, _, _) = match cursor_context(text, pos) {
+        Some(ctx) => ctx,
+        None => return false,
+    };
     if let Some(m) = attr_re.captures_iter(&before).last() {
         let quote = m[1].chars().next().unwrap_or('"');
-        let after_quote = &before[m.get(0).unwrap().end()..];
-        !after_quote.contains(quote)
+        !before[m.get(0).unwrap().end()..].contains(quote)
     } else {
         false
     }
 }
 
-/// Returns the CSS identifier fragment immediately before the cursor within a
-/// `style="..."` attribute value. Used to detect `--variable` prefixes.
-fn style_prefix(text: &str, pos: Position) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let line_idx = pos.line as usize;
-    if line_idx >= lines.len() {
-        return String::new();
+/// Converts a UTF-16 code-unit offset (as sent by LSP clients) to a UTF-8 byte
+/// offset into `line`. The LSP spec mandates UTF-16 column counts; naively using
+/// them as byte indices panics on any line containing multi-byte UTF-8 characters.
+fn utf16_offset_to_byte(line: &str, utf16_col: usize) -> usize {
+    let mut u16_count = 0usize;
+    for (byte_idx, c) in line.char_indices() {
+        if u16_count >= utf16_col {
+            return byte_idx;
+        }
+        u16_count += c.len_utf16();
     }
-    let col = (pos.character as usize).min(lines[line_idx].len());
+    line.len()
+}
 
+/// Returns `(text_before_cursor, current_line, col)` in a single pass over
+/// `text.lines()`. Shared by all position-dependent helpers to avoid building
+/// the "before" string redundantly in each one.
+fn cursor_context<'a>(text: &'a str, pos: Position) -> Option<(String, &'a str, usize)> {
+    let line_idx = pos.line as usize;
     let mut before = String::new();
-    for (i, l) in lines.iter().enumerate() {
+    for (i, l) in text.lines().enumerate() {
         if i < line_idx {
             before.push_str(l);
             before.push('\n');
         } else {
+            let col = utf16_offset_to_byte(l, pos.character as usize);
             before.push_str(&l[..col]);
-            break;
+            return Some((before, l, col));
         }
     }
+    None
+}
 
+/// Returns the CSS identifier fragment immediately before the cursor within a
+/// `style="..."` attribute value. Used to detect `--variable` prefixes.
+fn style_prefix(text: &str, pos: Position) -> String {
+    let (before, _, _) = match cursor_context(text, pos) {
+        Some(ctx) => ctx,
+        None => return String::new(),
+    };
     let last_match = match style_attr_re().captures_iter(&before).last() {
         Some(m) => m,
         None => return String::new(),
     };
-
-    let value_start = last_match.get(0).unwrap().end();
-    extract_prefix(&before[value_start..])
+    extract_prefix(&before[last_match.get(0).unwrap().end()..])
 }
 
 fn completion_context(text: &str, pos: Position) -> (HashSet<String>, String) {
-    let lines: Vec<&str> = text.lines().collect();
-    let line_idx = pos.line as usize;
-    if line_idx >= lines.len() {
-        return (HashSet::new(), String::new());
-    }
-    let line = lines[line_idx];
-    let col = (pos.character as usize).min(line.len());
-
-    let mut before = String::new();
-    for (i, l) in lines.iter().enumerate() {
-        if i < line_idx {
-            before.push_str(l);
-            before.push('\n');
-        } else {
-            before.push_str(&l[..col]);
-            break;
-        }
-    }
+    let (before, line, col) = match cursor_context(text, pos) {
+        Some(ctx) => ctx,
+        None => return (HashSet::new(), String::new()),
+    };
 
     let last_match = match class_attr_re().captures_iter(&before).last() {
         Some(m) => m,
@@ -937,24 +942,10 @@ fn completion_context(text: &str, pos: Position) -> (HashSet<String>, String) {
 }
 
 fn id_completion_context(text: &str, pos: Position) -> (bool, String) {
-    let lines: Vec<&str> = text.lines().collect();
-    let line_idx = pos.line as usize;
-    if line_idx >= lines.len() {
-        return (false, String::new());
-    }
-    let line = lines[line_idx];
-    let col = (pos.character as usize).min(line.len());
-
-    let mut before = String::new();
-    for (i, l) in lines.iter().enumerate() {
-        if i < line_idx {
-            before.push_str(l);
-            before.push('\n');
-        } else {
-            before.push_str(&l[..col]);
-            break;
-        }
-    }
+    let (before, line, col) = match cursor_context(text, pos) {
+        Some(ctx) => ctx,
+        None => return (false, String::new()),
+    };
 
     let last_match = match id_attr_re().captures_iter(&before).last() {
         Some(m) => m,
@@ -990,22 +981,12 @@ fn extract_prefix(s: &str) -> String {
     s[start..].to_string()
 }
 
-fn build_insert_text(name: &str, text: &str, pos: Position) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let line_idx = pos.line as usize;
-    if line_idx >= lines.len() {
-        return name.to_string();
-    }
-    let line = lines[line_idx];
-    let col = (pos.character as usize).min(line.len());
+fn build_insert_text(name: &str, line: &str, col: usize) -> String {
     let bytes = line.as_bytes();
-
     let before_char = if col > 0 { bytes.get(col - 1).copied() } else { None };
     let after_char = bytes.get(col).copied();
-
-    let needs_space_before = before_char.map_or(false, is_ident_byte);
-    let needs_space_after = after_char.map_or(false, is_ident_byte);
-
+    let needs_space_before = before_char.is_some_and(is_ident_byte);
+    let needs_space_after = after_char.is_some_and(is_ident_byte);
     match (needs_space_before, needs_space_after) {
         (true, true) => format!(" {name} "),
         (true, false) => format!(" {name}"),
@@ -1015,13 +996,7 @@ fn build_insert_text(name: &str, text: &str, pos: Position) -> String {
 }
 
 fn word_at(text: &str, pos: Position) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let line_idx = pos.line as usize;
-    if line_idx >= lines.len() {
-        return None;
-    }
-    let line = lines[line_idx];
-    let col = pos.character as usize;
+    let (_, line, col) = cursor_context(text, pos)?;
     let bytes = line.as_bytes();
 
     if col >= bytes.len() || !is_ident_byte(bytes[col]) {
@@ -1046,6 +1021,18 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
 }
 
+/// Returns true if `s` is a safe ASCII CSS identifier.
+/// Guards rename and code-action inputs against CSS syntax injection.
+/// Per CSS Syntax Level 3, identifiers cannot start with an unescaped digit.
+fn is_valid_css_ident(s: &str) -> bool {
+    if s.is_empty() { return false; }
+    let bytes = s.as_bytes();
+    !bytes[0].is_ascii_digit()
+        && bytes
+            .iter()
+            .all(|&b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_'))
+}
+
 // ---------------------------------------------------------------------------
 // CSS parsing
 // ---------------------------------------------------------------------------
@@ -1054,6 +1041,11 @@ fn is_ident_byte(b: u8) -> bool {
 const MAX_CSS_BYTES: u64 = 500 * 1024;
 
 fn scan_directory(root: &Path, class_map: &mut ClassMap) {
+    // A single shared visited set across all files prevents parsing the same
+    // file twice when it appears directly in the workspace AND is @import-ed by
+    // another file — which would otherwise produce false-positive duplicate-selector
+    // warnings for every class in the imported file.
+    let mut visited: HashSet<PathBuf> = HashSet::new();
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -1064,7 +1056,7 @@ fn scan_directory(root: &Path, class_map: &mut ClassMap) {
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().map_or(false, |ext| ext == "css"))
     {
-        parse_css_file(entry.path(), class_map);
+        parse_css_file_inner(entry.path(), class_map, &mut visited);
     }
 }
 
@@ -1248,7 +1240,14 @@ fn extract_imports(content: &str) -> Vec<String> {
         .captures_iter(content)
         .filter_map(|cap| cap.get(1))
         .map(|m| m.as_str().to_string())
-        .filter(|p| !p.starts_with("http://") && !p.starts_with("https://") && !p.starts_with("//"))
+        .filter(|p| {
+            // Reject network URLs and absolute paths to prevent reading files
+            // outside the project tree via @import.
+            !p.starts_with("http://")
+                && !p.starts_with("https://")
+                && !p.starts_with("//")
+                && !Path::new(p).is_absolute()
+        })
         .map(|mut p| {
             if !p.contains('.') { p.push_str(".css"); }
             p
@@ -1408,10 +1407,12 @@ fn workspace_html_refs(
 // Code action helpers
 // ---------------------------------------------------------------------------
 
-/// Extracts the single-quoted name from a message like `"Unknown CSS class 'btn'"`.
+/// Extracts the first single-quoted token from a message like `"Unknown CSS class 'btn'"`.
+/// Using find twice (not rfind) ensures we always get the FIRST quoted span,
+/// so messages with multiple quoted tokens don't produce garbage extractions.
 fn extract_quoted(msg: &str) -> Option<String> {
     let start = msg.find('\'')? + 1;
-    let end = msg.rfind('\'')?;
+    let end = start + msg[start..].find('\'')?;
     if end <= start { return None; }
     Some(msg[start..end].to_string())
 }
@@ -1625,17 +1626,16 @@ fn specificity(selector: &str) -> (u32, u32, u32) {
 
 /// Returns a formatted string of unique color values found in `properties`.
 fn color_summary(properties: &str) -> String {
-    let mut seen: IndexedSet = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut order: Vec<&str> = Vec::new();
     for m in color_re().find_iter(properties) {
-        let v = m.as_str().to_string();
-        if !seen.contains(&v) {
-            seen.push(v);
+        let v = m.as_str();
+        if seen.insert(v) {
+            order.push(v);
         }
     }
-    seen.into_iter()
+    order.into_iter()
         .map(|c| format!("`{c}`"))
         .collect::<Vec<_>>()
         .join(" ")
 }
-
-type IndexedSet = Vec<String>;
